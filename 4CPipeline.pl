@@ -111,6 +111,10 @@ sub process_experiment ($) {
 #	align_to_sequence_files;
 #
 #	align_to_genome;
+#
+# combine_to_tlx; 
+#
+# filter_reads;
 }
 
 sub read_in_meta_file {
@@ -125,6 +129,7 @@ sub read_in_meta_file {
 	$csv->column_names(@header);
 
 	while (my $row_ref = $csv->getline_hr($meta)) {
+
 		$expt_hash{$row_ref->{experiment}."_".$row_ref->{seqrun}} = $row_ref;
 	}
 	#print join("\t",@header)."\n";
