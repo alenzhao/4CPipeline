@@ -5,6 +5,9 @@ use strict;
 use warnings;
 use Getopt::Long;
 use Carp;
+use IO::File;
+use Text::CSV;
+use threads;
 use Interpolation 'arg:@->$' => \&argument;
 use Time::HiRes qw(gettimeofday tv_interval);
 
@@ -12,7 +15,7 @@ my $TOOLS = $ENV{'TOOLS'};
 my $ANNOT = $ENV{'ANNOT'};
 
 require "$TOOLS/Perlsub.pl";
-require "$TOOLS/PSLhelpers.pl";
+#require "$TOOLS/PSLhelpers.pl";
 
 # Flush output after every write
 select( (select(STDOUT), $| = 1 )[0] );
@@ -26,23 +29,22 @@ select( (select(STDOUT), $| = 1 )[0] );
 
 # Forward declarations
 sub parse_command_line;
+sub read_in_meta_file;
+sub check_existance_of_files;
+sub process_experiment;
 
 
 # Global flags and arguments, 
 # Set by command line arguments
-my $fastq;
+my $meta_file;
+my $indir;
 my $outdir;
-my $assembly;
-my $trim3 = 16;
-my $mismatch = 1;
-my $report = 1;
-my $threads = 8;
-my $skipmap;
-my $skipsam;
-my $skipbgbw;
+my $max_threads = 4;
 
-# Global variables 
-
+# Global variables
+my %expt_hash;
+my %stats; 
+my $genome2bit;
 
 #
 # Start of Program
@@ -52,50 +54,46 @@ parse_command_line;
 
 my $t0 = [gettimeofday];
 
-print "\nRunning Bowtie alignment for $fastq against $assembly assembly\n";
+read_in_meta_file;
 
-my $index = "$BOWTIE_IDX/$assembly";
-my $chrsize = "$ANNOT/chrSize.$assembly.txt";
+check_existance_of_files;
 
-my ($path,$name,$ext) = parseFilename($fastq);
+my @threads = ();
 
-my $sam = "$outdir/${name}.sam";
-my $bam = "$outdir/${name}.bam";
-my $sort = "$outdir/${name}_sort";
-my $bg_p = "$outdir/${name}_p.bg";
-my $bg_m = "$outdir/${name}_m.bg";
-my $bw_p = "$outdir/${name}_p.bw";
-my $bw_m = "$outdir/${name}_m.bw";
+foreach my $expt_id (sort keys %expt_hash) {
 
-unless (defined $skipmap) {
-	my $cmd = "bowtie $index -q $fastq --refout -v $mismatch -m $report -3 $trim3 --best --strata -t -a -p $threads";
-	System($cmd) or croak "Error: cannot complete bowtie command to default output format";
+    while (1) {
+
+    # joins any threads if possible
+        foreach my $thr (@threads) {
+            $thr->join() if $thr->is_joinable();
+        }
+
+        my @running = threads->list(threads::running);
+        
+        # if there are open threads, create a new one, push it onto list, and exit while loop
+        if (scalar @running < $max_threads) {
+            my $thr = threads->create( sub {
+                        my $t0_expt = [gettimeofday];
+                        print "\nStarting $expt_id\n";
+                        process_experiment($expt_id);
+                        my $t1 = tv_interval($t0_expt);
+                        printf("\nFinished %s with %d reads in %.2f seconds.\n", $expt_id, $stats{$expt_id}->{final},$t1);
+                    });
+            push(@threads,$thr);
+            sleep(1);
+            last;
+        }
+        sleep(1);
+    } 
 }
 
-
-unless (defined $skipsam) {
-	my $cmd = "bowtie $index -q $fastq -S $sam -v $mismatch -m $report -3 $trim3 --best --strata -t -a -p $threads";
-	System($cmd) or croak "Error: cannot complete bowtie command to SAM format output";
-
-	$cmd = "samtools view -S -b -o $bam $sam";
-	System($cmd) or croak "Error: cannot complete conversion to BAM format";
-
-	$cmd = "samtools sort $bam $sort";
-	System($cmd) or croak "Error: cannot complete sorting BAM file";
-
-	unless (defined $skipbgbw) {
-		$cmd = "time genomeCoverageBed -ibam $sort.bam -g $chrsize -strand + -bg > $bg_p";
-		System($cmd) or croak "Error: cannot complete conversion to bedgraph format for plus strand";
-
-		$cmd = "time genomeCoverageBed -ibam $sort.bam -g $chrsize -strand - -bg > $bg_m";
-		System($cmd) or croak "Error: cannot complete conversion to bedgraph format for minus strand";
-
-		$cmd = "time bedGraphToBigWig $bg_p $chrsize $bw_p";
-		System($cmd) or croak "Error: cannot complete conversion to bigwig format for plus strand";
-
-		$cmd = "time bedGraphToBigWig $bg_m $chrsize $bw_m";
-		System($cmd) or croak "Error: cannot complete conversion to bigwig format for minus strand";
-	}
+# waits for all threads to finish
+while( scalar threads->list(threads::all) > 0) {
+    for my $thr (@threads) {
+        $thr->join() if $thr->is_joinable;
+    }
+    sleep(1);
 }
 
 my $t1 = tv_interval($t0);
@@ -107,36 +105,91 @@ printf("\nFinished all processes in %.2f seconds.\n", $t1);
 # End of program
 #
 
+sub process_experiment ($) {
+#	create_sequence_files;
+#
+#	align_to_sequence_files;
+#
+#	align_to_genome;
+}
 
+sub read_in_meta_file {
+	System("perl -pi -e 's/\\r/\\n/g' $meta_file");
+
+	print "\nReading in meta file...\n";
+
+	my $meta = IO::File->new("<$meta_file");
+	my $csv = Text::CSV->new({sep_char => "\t"});
+	my $header_ref = $csv->getline($meta);
+	my @header = @$header_ref;
+	$csv->column_names(@header);
+
+	while (my $row_ref = $csv->getline_hr($meta)) {
+		$expt_hash{$row_ref->{experiment}."_".$row_ref->{seqrun}} = $row_ref;
+	}
+	#print join("\t",@header)."\n";
+	#foreach my $expt (sort keys %expt_hash) {
+	#	my $chr = $expt_hash{$expt}->{Chr};
+	#	my $brksite = $expt_hash{$expt}->{Brksite};
+	#	my $strand = $expt_hash{$expt}->{Strand};
+	#	my %hash = %{$expt_hash{$expt}};
+	#	print join("\t", @hash{@header} )."\n";
+	#}
+
+}
+
+sub check_existance_of_files {
+	print "\nSearching for files...\n";
+	foreach my $expt_id (sort keys %expt_hash) {
+		my $file = $indir."/".$expt_id;
+		my @exts = qw(.fa .fasta .fq .fastq);
+		foreach my $ext (@exts) {
+			if (-r $file.$ext) {
+				if ($ext =~ /q/) {
+					(my $next = $ext) =~ s/q/a/;
+					print "Converting $file to fasta format\n";
+					System("fastq_to_fasta -Q33 -n -i $file$ext -o $file$next") or croak "Error: could not execute fastq_to_fastq";
+					$expt_hash{$expt_id}->{file} = $file.$next;
+				} else {
+					$expt_hash{$expt_id}->{file} = $file.$ext;
+				}
+				last;
+			}
+		}
+		croak "Error: Could not locate reads file $file in $indir" unless (defined $expt_hash{$expt_id}->{file});
+	}
+	print "Done.\n";
+}
+
+sub create_sequence_files {
+
+}
 
 sub parse_command_line {
 	my $help;
 
 	usage() if (scalar @ARGV == 0);
 
-	my $result = GetOptions ( "trim3=i" => \$trim3,
-                            "mismatch=i" => \$mismatch,
-                            "report=i" => \$report,
-                            "threads=i" => \$threads,
-                            "skipmap" => \$skipmap,
-                            "skipsam" => \$skipsam,
-                            "skipbgbw" => \$skipbgbw,
-				            				"help" => \$help
-				            			) ;
+	my $result = GetOptions ( 
+														"threads" => \$max_threads ,
+														"help" => \$help
+
+				            			);
 	
 	usage() if ($help);
 
 	croak "Error: not enough input arguments" if (scalar @ARGV < 3);
 
-	$fastq = shift(@ARGV);
+	$meta_file = shift(@ARGV);
+	$indir = shift(@ARGV);
 	$outdir = shift(@ARGV);
-	$assembly = shift(@ARGV);
 
   #Check options
 
-  croak "Error: cannot read input file" unless (-r $fastq);
+  croak "Error: cannot find $meta_file" unless (-r $meta_file);
+  croak "Error: input directory $indir does not exist" unless (-d $indir);
   unless (-d $outdir) {
-  	System("mkdir $outdir") or croak "Error: output directory $outdir does not exist and cannot be created";
+  	System("mkdir -p $outdir") or croak "Error: output directory $outdir does not exist and cannot be created";
   }
 
 
@@ -158,16 +211,10 @@ Usage: $0 arg1 arg2 arg3 ...
 
 Arguments (defaults in parentheses):
 
-$arg{"fastq","Input sequence file"}
-$arg{"outdir","Directory for results files - note: default Bowtie output goes to working directory"}
-$arg{"assembly","Genome assembly to align reads to"}
-$arg{"--trim3","Number of basepairs to trim off of the 3' end of each read",$trim3}
-$arg{"--mismatch","Number of mismatches allowed in the alignment",$mismatch}
-$arg{"--report","Bowtie -m options: Number of alignments to report (reads with more equivalent alignments are suppressed)",$report}
-$arg{"--threads","Number of threads to run bowtie on","$threads"}
-$arg{"--skipmap","Skip reporting output in default Bowtie format"}
-$arg{"--skipsam","Skip reporting output in SAM format and all downstream steps (BAM,bedgraph,bigwig)"}
-$arg{"--skipbgbw","Skip converting BAM format to bedgraph and bigwig formats"}
+$arg{"metafile","File containing meta data for one experiment per row - follow correct format"}
+$arg{"indir","Directory containing all input sequence files"}
+$arg{"outdir","Directory for results files"}
+$arg{"--threads","Number of threads to run bowtie on","$max_threads"}
 $arg{"--help","This helpful help screen."}
 
 
